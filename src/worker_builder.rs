@@ -5,13 +5,13 @@ use bevy::{
     prelude::{AssetServer, World},
     render::{
         render_resource::{
-            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType,
+            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType, Texture,
             encase::{StorageBuffer, UniformBuffer, private::WriteInto},
         },
         renderer::RenderDevice,
     },
 };
-use wgpu::{BufferDescriptor, BufferUsages, util::BufferInitDescriptor};
+use wgpu::{BufferDescriptor, BufferUsages, TextureUsages, util::BufferInitDescriptor};
 
 use crate::{
     pipeline_cache::{AppCachedComputePipelineId, PipelineCache},
@@ -25,6 +25,7 @@ pub struct AppComputeWorkerBuilder<'a, W: ComputeWorker> {
     pub(crate) world: &'a mut World,
     pub(crate) cached_pipeline_ids: HashMap<String, AppCachedComputePipelineId>,
     pub(crate) buffers: HashMap<String, Buffer>,
+    pub(crate) textures: HashMap<String, Texture>,
     pub(crate) staging_buffers: HashMap<String, StagingBuffer>,
     pub(crate) steps: Vec<Step>,
     pub(crate) run_mode: RunMode,
@@ -35,6 +36,7 @@ pub struct AppComputeWorkerBuilder<'a, W: ComputeWorker> {
     /// 0 seconds means the shader will immediately be polled synchronously. None emeans the shader will only run asynchronously.
     pub(crate) maximum_async_time: Option<Duration>,
     extra_buffer_usages: Option<BufferUsages>,
+    extra_texture_usages: Option<TextureUsages>,
     _phantom: PhantomData<W>,
 }
 
@@ -47,11 +49,13 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
             world,
             cached_pipeline_ids: HashMap::default(),
             buffers: HashMap::default(),
+            textures: HashMap::default(),
             staging_buffers: HashMap::default(),
             steps: vec![],
             run_mode: RunMode::Continuous,
             maximum_async_time: Some(Duration::from_secs(0)),
             extra_buffer_usages: None,
+            extra_texture_usages: None,
             _phantom: PhantomData,
         }
     }
@@ -195,6 +199,18 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
                 mapped_at_creation: false,
             }),
         );
+        self
+    }
+
+    pub fn add_empty_storage_texture_2d_array(&mut self, name: &str, size: u64) -> &mut Self {
+        let render_device = self.world.resource::<RenderDevice>();
+        let mut usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::STORAGE_BINDING
+            | TextureUsages::COPY_SRC;
+        if let Some(extra_usages) = self.extra_texture_usages {
+            usage |= extra_usages;
+        }
+
         self
     }
 
