@@ -4,14 +4,19 @@ use bevy::{
     platform::collections::HashMap,
     prelude::{AssetServer, World},
     render::{
+        self,
         render_resource::{
-            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType, Texture,
+            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType, Texture, TextureView,
             encase::{StorageBuffer, UniformBuffer, private::WriteInto},
         },
-        renderer::RenderDevice,
+        renderer::{RenderDevice, RenderQueue},
     },
 };
-use wgpu::{BufferDescriptor, BufferUsages, TextureUsages, util::BufferInitDescriptor};
+use wgpu::{
+    BufferDescriptor, BufferUsages, Extent3d, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureViewDescriptor,
+    util::{BufferInitDescriptor, TextureDataOrder},
+};
 
 use crate::{
     pipeline_cache::{AppCachedComputePipelineId, PipelineCache},
@@ -26,6 +31,7 @@ pub struct AppComputeWorkerBuilder<'a, W: ComputeWorker> {
     pub(crate) cached_pipeline_ids: HashMap<String, AppCachedComputePipelineId>,
     pub(crate) buffers: HashMap<String, Buffer>,
     pub(crate) textures: HashMap<String, Texture>,
+    pub(crate) views: HashMap<String, TextureView>,
     pub(crate) staging_buffers: HashMap<String, StagingBuffer>,
     pub(crate) steps: Vec<Step>,
     pub(crate) run_mode: RunMode,
@@ -50,6 +56,7 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
             cached_pipeline_ids: HashMap::default(),
             buffers: HashMap::default(),
             textures: HashMap::default(),
+            views: HashMap::default(),
             staging_buffers: HashMap::default(),
             steps: vec![],
             run_mode: RunMode::Continuous,
@@ -104,6 +111,93 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
                 usage,
             }),
         );
+        self
+    }
+
+    pub fn add_texture(
+        &mut self,
+        name: &str,
+        mut desc: TextureDescriptor,
+        data: &[u8],
+    ) -> &mut Self {
+        let render_device = self.world.resource::<RenderDevice>();
+        let render_queue = self.world.resource::<RenderQueue>();
+
+        let usages = TextureUsages::COPY_DST
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::STORAGE_BINDING;
+        desc.usage |= usages;
+        if let Some(extra_usages) = self.extra_texture_usages {
+            desc.usage |= extra_usages;
+        }
+
+        let texture = render_device.create_texture_with_data(
+            render_queue,
+            &desc,
+            TextureDataOrder::MipMajor,
+            data,
+        );
+
+        self.textures.insert(name.to_owned(), texture);
+        self
+    }
+
+    pub fn add_empty_texture(&mut self, name: &str, mut desc: TextureDescriptor) -> &mut Self {
+        let render_device = self.world.resource::<RenderDevice>();
+
+        let usages = TextureUsages::COPY_DST
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::STORAGE_BINDING;
+        desc.usage |= usages;
+        if let Some(extra_usages) = self.extra_texture_usages {
+            desc.usage |= extra_usages;
+        }
+
+        let texture = render_device.create_texture(&desc);
+
+        self.textures.insert(name.to_owned(), texture);
+        self
+    }
+
+    pub fn create_storage_view(
+        &mut self,
+        texture: &str,
+        name: &str,
+        mut desc: TextureViewDescriptor,
+    ) -> &mut Self {
+        let usages = TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING;
+        if let Some(usage) = desc.usage.as_mut() {
+            *usage |= usages;
+        } else {
+            desc.usage = Some(usages);
+        }
+        let view = self
+            .textures
+            .get(texture)
+            .expect("Could not find texture, be sure to create it first")
+            .create_view(&desc);
+        self.views.insert(name.to_owned(), view);
+        self
+    }
+
+    pub fn create_texture_view(
+        &mut self,
+        texture: &str,
+        name: &str,
+        mut desc: TextureViewDescriptor,
+    ) -> &mut Self {
+        let usages = TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING;
+        if let Some(usage) = desc.usage.as_mut() {
+            *usage |= usages;
+        } else {
+            desc.usage = Some(usages);
+        }
+        let view = self
+            .textures
+            .get(texture)
+            .expect("Could not find texture, be sure to create it first")
+            .create_view(&desc);
+        self.views.insert(name.to_owned(), view);
         self
     }
 
@@ -199,18 +293,6 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
                 mapped_at_creation: false,
             }),
         );
-        self
-    }
-
-    pub fn add_empty_storage_texture_2d_array(&mut self, name: &str, size: u64) -> &mut Self {
-        let render_device = self.world.resource::<RenderDevice>();
-        let mut usage = TextureUsages::TEXTURE_BINDING
-            | TextureUsages::STORAGE_BINDING
-            | TextureUsages::COPY_SRC;
-        if let Some(extra_usages) = self.extra_texture_usages {
-            usage |= extra_usages;
-        }
-
         self
     }
 

@@ -9,12 +9,15 @@ use bevy::{
     platform::collections::HashMap,
     prelude::{Res, ResMut, Resource},
     render::{
-        render_resource::{Buffer, ComputePipeline},
+        render_resource::{Buffer, ComputePipeline, Texture, TextureView},
         renderer::{RenderDevice, RenderQueue},
     },
 };
 use bytemuck::{AnyBitPattern, NoUninit, bytes_of, cast_slice, from_bytes};
-use wgpu::{BindGroupEntry, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor};
+use wgpu::{
+    BindGroupEntry, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor, Extent3d,
+    Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+};
 
 use crate::{
     error::{Error, Result},
@@ -70,6 +73,8 @@ pub struct AppComputeWorker<W: ComputeWorker> {
     cached_pipeline_ids: HashMap<String, AppCachedComputePipelineId>,
     pipelines: HashMap<String, Option<ComputePipeline>>,
     buffers: HashMap<String, Buffer>,
+    textures: HashMap<String, Texture>,
+    views: HashMap<String, TextureView>,
     staging_buffers: HashMap<String, StagingBuffer>,
     steps: Vec<Step>,
     command_encoder: Option<CommandEncoder>,
@@ -104,6 +109,8 @@ impl<W: ComputeWorker> From<&AppComputeWorkerBuilder<'_, W>> for AppComputeWorke
             cached_pipeline_ids: builder.cached_pipeline_ids.clone(),
             pipelines,
             buffers: builder.buffers.clone(),
+            textures: builder.textures.clone(),
+            views: builder.views.clone(),
             staging_buffers: builder.staging_buffers.clone(),
             steps: builder.steps.clone(),
             command_encoder,
@@ -125,16 +132,21 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
 
         let mut entries = vec![];
         for (index, var) in compute_pass.vars.iter().enumerate() {
-            let Some(buffer) = self.buffers.get(var) else {
-                return Err(Error::BufferNotFound(var.to_owned()));
+            if let Some(buffer) = self.buffers.get(var) {
+                let entry = BindGroupEntry {
+                    binding: index as u32,
+                    resource: buffer.as_entire_binding(),
+                };
+                entries.push(entry);
+            } else if let Some(view) = self.views.get(var) {
+                let entry = BindGroupEntry {
+                    binding: index as u32,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                };
+                entries.push(entry);
+            } else {
+                return Err(Error::BufferOrTextureViewNotFound(var.to_owned()));
             };
-
-            let entry = BindGroupEntry {
-                binding: index as u32,
-                resource: buffer.as_entire_binding(),
-            };
-
-            entries.push(entry);
         }
 
         let Some(maybe_pipeline) = self.pipelines.get(&compute_pass.shader_type_path) else {
@@ -180,11 +192,11 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
         };
 
         if !self.buffers.contains_key(buf_a_name) {
-            return Err(Error::BufferNotFound(buf_a_name.to_owned()));
+            return Err(Error::BufferOrTextureViewNotFound(buf_a_name.to_owned()));
         }
 
         if !self.buffers.contains_key(buf_b_name) {
-            return Err(Error::BufferNotFound(buf_b_name.to_owned()));
+            return Err(Error::BufferOrTextureViewNotFound(buf_b_name.to_owned()));
         }
 
         let [Some(buffer_a), Some(buffer_b)] = self.buffers.get_many_mut([buf_a_name, buf_b_name])
@@ -204,7 +216,7 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
                 return Err(Error::EncoderIsNone);
             };
             let Some(buffer) = self.buffers.get(name) else {
-                return Err(Error::BufferNotFound(name.to_owned()));
+                return Err(Error::BufferOrTextureViewNotFound(name.to_owned()));
             };
 
             encoder.copy_buffer_to_buffer(
@@ -283,7 +295,7 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
     #[inline]
     pub fn try_write<T: NoUninit>(&mut self, target: &str, data: &T) -> Result<()> {
         let Some(buffer) = &self.buffers.get(target) else {
-            return Err(Error::BufferNotFound(target.to_owned()));
+            return Err(Error::BufferOrTextureViewNotFound(target.to_owned()));
         };
 
         let bytes = bytes_of(data);
@@ -300,11 +312,56 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
         self.try_write(target, data).unwrap()
     }
 
+    #[inline]
+    pub fn try_write_texture(
+        &mut self,
+        target: &str,
+        mip_level: u32,
+        origin: Origin3d,
+        aspect: TextureAspect,
+        data: &[u8],
+        layout: TexelCopyBufferLayout,
+        size: Extent3d,
+    ) -> Result<()> {
+        let Some(texture) = &self.textures.get(target) else {
+            return Err(Error::TextureNotFound(target.to_owned()));
+        };
+
+        self.render_queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level,
+                origin,
+                aspect,
+            },
+            data,
+            layout,
+            size,
+        );
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn write_texture(
+        &mut self,
+        target: &str,
+        mip_level: u32,
+        origin: Origin3d,
+        aspect: TextureAspect,
+        data: &[u8],
+        layout: TexelCopyBufferLayout,
+        size: Extent3d,
+    ) {
+        self.try_write_texture(target, mip_level, origin, aspect, data, layout, size)
+            .unwrap();
+    }
+
     /// Write data to `target` buffer.
     #[inline]
     pub fn try_write_slice<T: NoUninit>(&mut self, target: &str, data: &[T]) -> Result<()> {
         let Some(buffer) = &self.buffers.get(target) else {
-            return Err(Error::BufferNotFound(target.to_owned()));
+            return Err(Error::BufferOrTextureViewNotFound(target.to_owned()));
         };
 
         let bytes = cast_slice(data);
@@ -475,5 +532,13 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
 
     pub fn get_buffer(&self, target: &str) -> Option<&Buffer> {
         self.buffers.get(target)
+    }
+
+    pub fn get_texture_view(&self, target: &str) -> Option<&TextureView> {
+        self.views.get(target)
+    }
+
+    pub fn get_texture(&self, target: &str) -> Option<&Texture> {
+        self.textures.get(target)
     }
 }
